@@ -47,12 +47,30 @@ const int motor_right_in4 = 10;
 #define IR_DEBOUNCE_ON_MS  25   // 检出障碍：需持续 25ms 才认（快，防撞）
 #define IR_DEBOUNCE_OFF_MS 80   // 障碍消失：需持续 80ms 才认（慢，挡住回弹/反光抖动）
 
-#define SETTLE_MS        100    // 换向前的停顿，保护减速箱
+#define SETTLE_MS        150    // 停稳后再等这么久才换向（在斜坡+死区之外额外的间隙）
 #define BACKUP_MS_ONE    250    // 单侧障碍后退时长
 #define BACKUP_MS_BOTH   400    // 双侧障碍后退时长
 #define TURN_MS_ONE      450    // 单侧障碍转向时长
 #define TURN_MS_BOTH     700    // 双侧障碍转向时长
 #define TURN_STEP_MS     250    // 每连续被堵一次，转向时间加长
+
+/* ---------------- 电机 PWM 参数 ---------------- */
+// ESP32-S3 LEDC：4 个定时器 × 8 通道，4 路电机占 4 个通道，互不冲突
+#define MOTOR_PWM_FREQ   2000     // 2kHz：L298N 这类慢速驱动友好；换 TB6612/DRV8833 可提到 20000 消除啸叫
+#define MOTOR_PWM_RES    10       // 10bit -> 占空比 0~1023
+#define MOTOR_DUTY_MAX   ((1 << MOTOR_PWM_RES) - 1)
+
+// 换向保护：占空比斜坡 + 过零死区，避免硬切造成电流冲击和齿轮打齿
+#define MOTOR_RAMP_ENABLE 0
+#define RAMP_UP_STEP     6        // 每 10ms 上升 6%（0→60% 约 100ms）
+#define RAMP_DOWN_STEP   10       // 每 10ms 下降 10%（60→0 约 60ms）
+#define MOTOR_DEAD_MS    180      // 过零后必须静默这么久，才允许反向或重新起步
+
+#define SPEED_FWD        40       // 前进速度 %
+#define SPEED_BACK       35       // 后退速度 %
+#define SPEED_TURN       40       // 原地转向速度 %（要克服静摩擦，给大一点）
+#define TRIM_LEFT        100      // 左轮修正 %（跑偏时微调，100 = 不修正）
+#define TRIM_RIGHT       100      // 右轮修正 %
 
 /* ---------------- 内部常量 ---------------- */
 #define IR_LEFT_BIT   0x01
@@ -71,19 +89,99 @@ enum Phase : uint8_t {
 static QueueHandle_t irQueue = nullptr;   // 长度 1，永远只存最新采样结果
 static volatile uint8_t g_phase = P_FORWARD;  // 给指示线程看
 
-/* ---------------- 电机底层 ---------------- */
-inline void motorWrite(int l1, int l2, int r1, int r2) {
-  digitalWrite(motor_left_in1,  l1);
-  digitalWrite(motor_left_in2,  l2);
-  digitalWrite(motor_right_in3, r1);
-  digitalWrite(motor_right_in4, r2);
+/* ---------------- 电机底层（PWM + 斜坡 + 死区） ---------------- */
+// 每个电机两个输入脚：一个出 PWM、另一个拉低 → 转速可调，方向由哪一相出 PWM 决定。
+// 上层只设“目标速度”，motorTick() 每 10ms 把实际占空比往目标靠：
+//   加速/减速走斜坡，过零点后强制静默 MOTOR_DEAD_MS 才允许反向 —— 硬切换的冲击就被抹平了。
+struct Axis {
+  int      cur;       // 当前实际占空比 -100~100
+  int      target;    // 目标占空比 -100~100
+  uint32_t tZero;     // 最近一次降到 0 的时刻
+};
+
+static Axis axisL = {0, 0, 0};
+static Axis axisR = {0, 0, 0};
+
+static inline int motorDrive(int pinA, int pinB, int speedPct) {
+  if (speedPct > 100)  speedPct = 100;
+  if (speedPct < -100) speedPct = -100;
+
+  uint32_t duty = (uint32_t)MOTOR_DUTY_MAX * (uint32_t)abs(speedPct) / 100;
+  if (speedPct >= 0) {
+    ledcWrite(pinA, duty);
+    ledcWrite(pinB, 0);
+  } else {
+    ledcWrite(pinA, 0);
+    ledcWrite(pinB, duty);
+  }
+  return speedPct;
 }
 
-void carForward()  { motorWrite(1, 0, 1, 0); }   // 双电机正转
-void carBackward() { motorWrite(0, 1, 0, 1); }
-void carTurnLeft() { motorWrite(0, 1, 1, 0); }   // 左轮反转 + 右轮正转
-void carTurnRight(){ motorWrite(1, 0, 0, 1); }   // 左轮正转 + 右轮反转
-void carStop()     { motorWrite(0, 0, 0, 0); }
+// 单轴走一步：cur 朝 target 逼近
+static void axisStep(Axis &a, uint32_t now) {
+#if MOTOR_RAMP_ENABLE
+  if (a.cur == a.target) return;
+
+  // 已经停在零点：等死区时间过去再起步/反向
+  if (a.cur == 0) {
+    if (now - a.tZero < MOTOR_DEAD_MS) return;
+    int step = (abs(a.target) < RAMP_UP_STEP) ? abs(a.target) : RAMP_UP_STEP;
+    a.cur = (a.target > 0) ? step : -step;
+    return;
+  }
+
+  bool reversing = (a.cur > 0 && a.target < 0) || (a.cur < 0 && a.target > 0);
+  int  step = (reversing || abs(a.target) <= abs(a.cur)) ? RAMP_DOWN_STEP : RAMP_UP_STEP;
+
+  if (a.cur > 0) { a.cur -= step; if (a.cur < 0) a.cur = 0; }
+  else           { a.cur += step; if (a.cur > 0) a.cur = 0; }
+
+  if (a.cur == 0) a.tZero = now;      // 记录过零时刻，开始数死区
+#else
+  a.cur = a.target;
+  if (a.cur == 0) a.tZero = now;
+#endif
+}
+
+// 把当前占空比刷到 LEDC。drive 任务每个 tick 调一次
+static void motorTick() {
+  uint32_t now = millis();
+  axisStep(axisL, now);
+  axisStep(axisR, now);
+  motorDrive(motor_left_in1,  motor_left_in2,  axisL.cur * TRIM_LEFT  / 100);
+  motorDrive(motor_right_in3, motor_right_in4, axisR.cur * TRIM_RIGHT / 100);
+}
+
+// 两个轴都真正停住了（目标为 0 且实际已归零）
+static bool motorAtRest() {
+  return axisL.target == 0 && axisR.target == 0 && axisL.cur == 0 && axisR.cur == 0;
+}
+
+// 停稳之后又静默了 SETTLE_MS（换向前要求的间隙）
+static bool restElapsed(uint32_t &tRest) {
+  uint32_t now = millis();
+  if (!motorAtRest()) { tRest = 0; return false; }
+  if (tRest == 0) tRest = now;
+  return (now - tRest) >= SETTLE_MS;
+}
+
+// 立即断电（初始化/急停用），不走斜坡
+static void motorStopNow() {
+  uint32_t now = millis();
+  axisL.cur = axisL.target = 0; axisL.tZero = now;
+  axisR.cur = axisR.target = 0; axisR.tZero = now;
+  motorDrive(motor_left_in1,  motor_left_in2,  0);
+  motorDrive(motor_right_in3, motor_right_in4, 0);
+}
+
+static void motorLeft(int speedPct)  { axisL.target = constrain(speedPct, -100, 100); }
+static void motorRight(int speedPct) { axisR.target = constrain(speedPct, -100, 100); }
+
+void carForward()  { motorLeft( SPEED_FWD);  motorRight( SPEED_FWD); }   // 双电机正转
+void carBackward() { motorLeft(-SPEED_BACK); motorRight(-SPEED_BACK); }
+void carTurnLeft() { motorLeft(-SPEED_TURN); motorRight( SPEED_TURN); }  // 左轮反转 + 右轮正转
+void carTurnRight(){ motorLeft( SPEED_TURN); motorRight(-SPEED_TURN); }  // 左轮正转 + 右轮反转
+void carStop()     { motorLeft(0); motorRight(0); }                      // 平滑停车
 
 /* ---------------- 线程 1：IR 采样 + 消抖 ---------------- */
 // 单路时间窗消抖：状态变化必须持续超过阈值才被采纳。
@@ -139,8 +237,9 @@ void taskDrive(void *arg) {
   bool     turnRight = true;
   uint8_t  blocked   = 0;        // 连续被堵次数
   uint32_t tClear    = 0;        // 连续畅通计时起点
+  uint32_t tRest     = 0;        // 电机停稳时刻（0 = 还在动）
 
-  carStop();
+  motorStopNow();
   vTaskDelay(pdMS_TO_TICKS(200));
 
   for (;;) {
@@ -184,34 +283,39 @@ void taskDrive(void *arg) {
         }
         break;
 
-      case P_STOP1:
-        if (dt >= SETTLE_MS) { carBackward(); ph = P_BACK; tPhase = millis(); }
+      case P_STOP1:   // 前进 → 后退：等车真正停稳，再额外等 SETTLE_MS
+        if (!restElapsed(tRest)) break;
+        carBackward();
+        ph = P_BACK;
+        tPhase = millis();
         break;
 
       case P_BACK:
+        // 死区期间电机还没动，重新计时，保证实际后退时长足量
+        if (axisL.cur == 0 && axisR.cur == 0) { tPhase = millis(); break; }
         if (dt >= backMs) { carStop(); ph = P_STOP2; tPhase = millis(); }
         break;
 
-      case P_STOP2:
-        if (dt >= SETTLE_MS) {
-          if (turnRight) carTurnRight(); else carTurnLeft();
-          ph = P_TURN;
-          tPhase = millis();
-        }
+      case P_STOP2:   // 后退 → 转向
+        if (!restElapsed(tRest)) break;
+        if (turnRight) carTurnRight(); else carTurnLeft();
+        ph = P_TURN;
+        tPhase = millis();
         break;
 
       case P_TURN:
+        if (axisL.cur == 0 && axisR.cur == 0) { tPhase = millis(); break; }
         if (dt >= turnMs) { carStop(); ph = P_STOP3; tPhase = millis(); }
         break;
 
-      case P_STOP3:
-        if (dt >= SETTLE_MS) {
-          ph = P_FORWARD;
-          tPhase = millis();
-        }
+      case P_STOP3:   // 转向 → 前进
+        if (!restElapsed(tRest)) break;
+        ph = P_FORWARD;
+        tPhase = millis();
         break;
     }
 
+    motorTick();          // 每 tick 刷新斜坡 + PWM
     g_phase = (uint8_t)ph;
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -264,10 +368,13 @@ void setup() {
   pinMode(ir_left,  INPUT);
   pinMode(ir_right, INPUT);
 
-  pinMode(motor_left_in1,  OUTPUT);
-  pinMode(motor_left_in2,  OUTPUT);
-  pinMode(motor_right_in3, OUTPUT);
-  pinMode(motor_right_in4, OUTPUT);
+  // 4 个电机脚全部挂到 LEDC，各自独立通道，默认占空比 0（相当于原来的 digitalWrite 0）
+  if (!ledcAttach(motor_left_in1,  MOTOR_PWM_FREQ, MOTOR_PWM_RES) ||
+      !ledcAttach(motor_left_in2,  MOTOR_PWM_FREQ, MOTOR_PWM_RES) ||
+      !ledcAttach(motor_right_in3, MOTOR_PWM_FREQ, MOTOR_PWM_RES) ||
+      !ledcAttach(motor_right_in4, MOTOR_PWM_FREQ, MOTOR_PWM_RES)) {
+    Serial.println("[ERR] LEDC attach failed");
+  }
 
   carStop();
 
