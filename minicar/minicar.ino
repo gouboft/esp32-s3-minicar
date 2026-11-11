@@ -1,31 +1,63 @@
 /*
- * MiniCar - ESP32-S3 红外避障 + 手机 WiFi 遥控（FreeRTOS 多线程版）
+ * MiniCar - ESP32-S3 红外避障 + 手机遥控（FreeRTOS 多线程版）
  *
  * 线程划分：
  *   taskIrSensor  (core 1) : 5ms 采样 + 25/80ms 不对称消抖，只负责“看”
  *   taskDrive     (core 1) : 10ms tick 的非阻塞状态机，只负责“动”
  *   taskIndicator (core 0) : 状态灯 / WS2812 显示，只负责“说”
- *   taskComm      (core 0) : WiFi AP + HTTP/WebSocket，只负责“听手机的”
+ *   taskComm      (core 0) : 通信层，只负责“听手机的”
+ *                            COMM_BLE=1 -> BLE GATT（手机 Chrome 走 Web Bluetooth）
+ *                            COMM_WIFI=1 -> WiFi AP + HTTP/WebSocket（原方案）
  *
  * 避障策略（左/右 IR）：
  *   左边有障碍 -> 后退一小段 -> 右转 -> 前进
  *   右边有障碍 -> 后退一小段 -> 左转 -> 前进
  *   两边都有   -> 后退长一点 -> 随机大角度转 -> 前进（连续被堵会越转越多）
  *
- * 手机控制：连热点 MiniCar-xxxx，浏览器打开 192.168.4.1
+ * 手机控制：
+ *   BLE 模式（推荐）：手机 Chrome 打开托管的 HTTPS 页面 -> 点「连接小车」选 MiniCar
+ *   WiFi 模式：连热点 MiniCar-xxxx，浏览器打开 192.168.4.1
+ *   上电默认「手动 + 停止」：不动就一直停着，防止开机自己跑
+ *   只有在网页上点「切到自动」才会开始自动避障
  *   手动模式下 IR 仍保留安全保护：检出障碍禁止继续前进，只允许后退/转向
  */
 
+/* ---------------- 功能开关 ---------------- */
+// OLED 显示总开关：0 = 完全编译掉（不占引脚、不建任务、不占 flash）
+// 调试遥控时先关掉它，确认问题是否出在显示上
+#define ENABLE_OLED 0
+
+// 通信方式二选一（ESP32-S3 只有 BLE，没有经典蓝牙）
+//   COMM_BLE  1 : 手机 Chrome 走 Web Bluetooth 直连，不用连热点
+//   COMM_WIFI 1 : 原来的 WiFi 热点 + 网页方案，保留以便随时切回
+// 两个都设 1 也能跑（WiFi/BLE 共存），但射频互抢会拉高延迟，一般没必要
+#define COMM_BLE   1
+#define COMM_WIFI  0
+
 #include <Adafruit_NeoPixel.h>
+#if ENABLE_OLED
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#endif
+#if COMM_WIFI
 #include <WiFi.h>
 #include <esp_http_server.h>
+#endif
+#if COMM_BLE
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#endif
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <string.h>
 #include <stdlib.h>
 
+#if COMM_WIFI
 #include "web_page.h"
+#endif
 
 /* ---------------- 引脚 ---------------- */
 #define PIN_STRIP   48
@@ -56,6 +88,43 @@ const int motor_right_in4 = 10;
 #define BUZZER_ACTIVE  0
 #define BUZZER_ACTIVE_ON_LEVEL HIGH   // 有源蜂鸣器“响”对应电平；板上带三极管反相就改 LOW
 #define BUZZER_FREQ    2700     // 无源蜂鸣器谐振频率，2~2.7kHz 最响
+
+/* ---------------- SPI OLED 0.97" (SSD1306 128x64，6 针) ---------------- */
+#if ENABLE_OLED
+// 6 针 = SPI 无 CS（模块内部把 CS 接地）。丝印的 D0 长得像 DO、D1 像 DI：
+//   D0 = 时钟 SCK      D1 = 数据 MOSI
+//
+// ★★ 黑屏排查：只改下面这个数字，重新烧录，接线按对应表格来 ★★
+//   0 = D0->IO17  D1->IO19  DC->IO5  RST->IO18   ← 你现在的接法
+//   1 = D0->IO19  D1->IO17  DC->IO5  RST->IO18   ← 怀疑 D0/D1 接反
+//   2 = D0->IO4   D1->IO7   DC->IO5  RST->IO15   ← 换排针，避开 USB 脚 IO19/IO20
+#define OLED_MODE 0
+
+#define OLED_W   128
+#define OLED_H   64
+
+#if   OLED_MODE == 1
+  #define OLED_CLK   19
+  #define OLED_MOSI  17
+  #define OLED_DC    5
+  #define OLED_RST   18
+#elif OLED_MODE == 2
+  #define OLED_CLK   4
+  #define OLED_MOSI  7
+  #define OLED_DC    5
+  #define OLED_RST   15
+#else
+  #define OLED_CLK   17
+  #define OLED_MOSI  19
+  #define OLED_DC    5
+  #define OLED_RST   18
+#endif
+
+#define OLED_CS    -1        // -1 = 无 CS（模块内部接地）
+
+// 软件 SPI 构造，参数顺序：宽, 高, MOSI, CLK, DC, RST, CS
+Adafruit_SSD1306 display(OLED_W, OLED_H, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RST, OLED_CS);
+#endif  // ENABLE_OLED
 
 /* ---------------- 可调参数 ---------------- */
 // IR 检测到障碍时输出的电平。若实测方向相反，把 HIGH 改成 LOW
@@ -109,17 +178,19 @@ enum Phase : uint8_t {
   P_BACK,       // 后退
   P_STOP2,      // 转向之前停顿
   P_TURN,       // 原地转向
-  P_STOP3       // 转完回正
+  P_STOP3,      // 转完回正
+  P_IDLE        // 手动模式下的静止
 };
 
 static QueueHandle_t irQueue = nullptr;   // 长度 1，永远只存最新采样结果
-static volatile uint8_t g_phase = P_FORWARD;  // 给指示线程看
+static volatile uint8_t g_phase = P_IDLE; // 给指示线程看：上电即静止
 
 /* ---------------- 遥控共享状态 ---------------- */
 enum : uint8_t { MODE_AUTO = 0, MODE_MANUAL = 1 };
 
 // 只对 32 位对齐变量做单次读写，Xtensa 上是原子的，不加锁也读不到“半截”值
-static volatile uint8_t  g_mode    = MODE_AUTO;
+// 上电默认手动：g_lastCmd=0 会让第一条 stale 判断直接成立 -> 立即停车
+static volatile uint8_t  g_mode    = MODE_MANUAL;
 static volatile int      g_remoteL = 0;    // 手机下发的左轮速度 -100~100
 static volatile int      g_remoteR = 0;
 static volatile uint32_t g_lastCmd = 0;    // 最近一次收到指令的时刻
@@ -338,7 +409,7 @@ void taskDrive(void *arg) {
       // 手动模式下只要有一侧在倒转，也嘀嘀提示
       g_buzzer = ((l < 0) || (r < 0)) ? BUZZ_BACK : BUZZ_OFF;
 
-      g_phase = P_FORWARD;
+      g_phase = (l || r) ? P_FORWARD : P_IDLE;
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
     }
@@ -475,16 +546,9 @@ void taskIndicator(void *arg) {
   }
 }
 
-/* ---------------- 线程 4：WiFi AP + 网页遥控 ---------------- */
-static httpd_handle_t s_httpd = nullptr;
-static volatile int   s_wsFd  = -1;         // 当前 WebSocket 客户端 fd
+/* ---------------- 线程 4：通信层 ---------------- */
 
-static esp_err_t handleRoot(httpd_req_t *req) {
-  httpd_resp_set_type(req, "text/html; charset=utf-8");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
-}
-
+/* ---- 指令解析：WiFi 和 BLE 共用同一套文本协议 ---- */
 // 指令格式："M,<左>,<右>" 手动差速 / "A" 切自动避障 / "S" 急停
 static void handleCmd(char *s) {
   while (*s == ' ') s++;
@@ -511,6 +575,17 @@ static void handleCmd(char *s) {
     g_lastCmd = millis();
     Serial.println("[CMD] 急停");
   }
+}
+
+/* ==================== 方式 A：WiFi 热点 + 网页 ==================== */
+#if COMM_WIFI
+static httpd_handle_t s_httpd = nullptr;
+static volatile int   s_wsFd  = -1;         // 当前 WebSocket 客户端 fd
+
+static esp_err_t handleRoot(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t handleWs(httpd_req_t *req) {
@@ -570,7 +645,7 @@ static void startWebServer() {
   Serial.println("[WEB] http://192.168.4.1/");
 }
 
-void taskComm(void *arg) {
+void taskCommWifi(void *arg) {
   String ssid = String(AP_SSID_PREFIX) + String((uint32_t)(ESP.getEfuseMac() & 0xFFFF), HEX);
 
   WiFi.mode(WIFI_AP);
@@ -593,7 +668,7 @@ void taskComm(void *arg) {
 
         char msg[40];
         snprintf(msg, sizeof(msg), "ST,%u,%u,%u",
-                 (unsigned)(g_mode == MODE_MANUAL),
+                 (unsigned)(g_mode == MODE_AUTO),      // 1 = 自动，和网页里的 autoMode 同名同义
                  (unsigned)((mask & IR_LEFT_BIT)  ? 1 : 0),
                  (unsigned)((mask & IR_RIGHT_BIT) ? 1 : 0));
 
@@ -612,6 +687,194 @@ void taskComm(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
+#endif  // COMM_WIFI
+
+/* ==================== 方式 B：BLE GATT（Web Bluetooth） ==================== */
+// 手机 Chrome 走 Web Bluetooth 直连，不用连热点、不用记 IP。
+// UUID 沿用 Nordic UART Service：nRF Connect 这类工具能直接认出来，方便绕开网页裸调。
+//   RX(6e400002) 手机 write  -> 车
+//   TX(6e400003) 车 notify   -> 手机
+#if COMM_BLE
+
+#define BLE_DEV_NAME  "MiniCar"
+#define SVC_UUID      "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define RX_UUID       "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define TX_UUID       "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+static BLEServer         *s_bleServer  = nullptr;
+static BLECharacteristic *s_bleTx      = nullptr;
+static volatile int       s_bleClients = 0;
+
+class BleServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *srv) override {
+    s_bleClients = srv->getConnectedCount();
+    Serial.printf("[BLE] 手机已连接 (%d)\n", s_bleClients);
+  }
+
+  // BLE 断开是静默的：不清状态的话 g_lastCmd 会一直保持旧值，车断开后还会接着跑。
+  // 这里直接把目标速度清零并重启广播，不等 REMOTE_TIMEOUT_MS 那 600ms。
+  void onDisconnect(BLEServer *srv) override {
+    s_bleClients = srv->getConnectedCount();
+    g_remoteL = 0;
+    g_remoteR = 0;
+    g_lastCmd = 0;
+    Serial.println("[BLE] 手机断开，已停车，重新广播");
+    srv->startAdvertising();
+  }
+};
+
+class BleRxCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    if (v.length() == 0 || v.length() > 63) return;
+    char buf[64];
+    v.toCharArray(buf, sizeof(buf));
+    handleCmd(buf);              // 和 WiFi 版完全同一套解析
+  }
+};
+
+static void startBle() {
+  BLEDevice::init(BLE_DEV_NAME);
+
+  s_bleServer = BLEDevice::createServer();
+  s_bleServer->setCallbacks(new BleServerCallbacks());
+
+  BLEService *svc = s_bleServer->createService(SVC_UUID);
+
+  BLECharacteristic *rx = svc->createCharacteristic(
+      RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  rx->setCallbacks(new BleRxCallbacks());
+
+  s_bleTx = svc->createCharacteristic(TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  s_bleTx->addDescriptor(new BLE2902());   // CCCD：手机写了 0x0001 才会收到 notify
+
+  svc->start();
+
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  // 刻意不广播 128 位服务 UUID：单个 UUID 就吃掉 18 字节，加 Flags 和设备名会超过
+  // 31 字节的 adv 上限，广告直接起不来。页面靠名字前缀过滤，访问权限由 optionalServices 给。
+  adv->setScanResponse(true);              // 设备名放 scan response，adv 包保持精简
+  adv->setMinPreferred(0x06);              // 建议 7.5ms 连接间隔（Android 不一定采纳）
+  adv->start();
+
+  Serial.printf("[BLE] \"%s\" 广播中，等手机连\n", BLE_DEV_NAME);
+}
+
+void taskCommBle(void *arg) {
+  startBle();
+
+  uint32_t tStat = 0;
+  char msg[40];
+
+  for (;;) {
+    if (s_bleClients > 0 && millis() - tStat >= STATUS_PUSH_MS) {
+      tStat = millis();
+
+      uint8_t mask = 0;
+      xQueuePeek(irQueue, &mask, 0);
+
+      snprintf(msg, sizeof(msg), "ST,%u,%u,%u",
+               (unsigned)(g_mode == MODE_AUTO),
+               (unsigned)((mask & IR_LEFT_BIT)  ? 1 : 0),
+               (unsigned)((mask & IR_RIGHT_BIT) ? 1 : 0));
+
+      s_bleTx->setValue((uint8_t *)msg, strlen(msg));
+      s_bleTx->notify();      // 手机没订阅时 Bluedroid 内部会丢掉，不用自己判断
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+#endif  // COMM_BLE
+
+/* ---------------- 线程 5：OLED 状态屏 ---------------- */
+#if ENABLE_OLED
+static const char *phaseName(uint8_t ph, bool manual) {
+  if (manual) return "REMOTE";
+  switch (ph) {
+    case P_FORWARD: return "FORWARD";
+    case P_STOP1:   return "BRAKE";
+    case P_BACK:    return "BACK";
+    case P_STOP2:   return "SWITCH";
+    case P_TURN:    return "TURN";
+    case P_STOP3:   return "ALIGN";
+    case P_IDLE:    return "IDLE";
+  }
+  return "?";
+}
+
+void taskDisplay(void *arg) {
+  // ---- 开机自检画面：能看到这行字，说明 SPI 接线和引脚全对 ----
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+  display.println("MiniCar");
+  display.setTextSize(1);
+  display.setCursor(0, 22);
+  display.println("OLED self-test");
+  display.setTextSize(3);
+  display.setCursor(0, 36);
+  display.println("OK");
+  display.display();
+  Serial.println("[OLED] self-test frame sent");
+  vTaskDelay(pdMS_TO_TICKS(1500));
+
+  for (;;) {
+    uint8_t mask = 0;
+    xQueuePeek(irQueue, &mask, 0);
+
+    bool    manual = (g_mode == MODE_MANUAL);
+    uint8_t ph     = g_phase;
+    char    line[28];
+
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+
+    // 标题栏：左边车名，右边模式
+    display.setCursor(0, 0);
+    display.print("MiniCar");
+    display.setCursor(manual ? 96 : 104, 0);
+    display.print(manual ? "MAN" : "AUTO");
+    display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+    // 主状态：大字相位
+    display.setTextSize(2);
+    display.setCursor(0, 14);
+    display.print(phaseName(ph, manual));
+
+    // IR 状态 + 左右目标速度
+    display.setTextSize(1);
+    snprintf(line, sizeof(line), "IR L%c R%c   L%3d R%3d",
+             (mask & IR_LEFT_BIT)  ? '!' : '-',
+             (mask & IR_RIGHT_BIT) ? '!' : '-',
+             axisL.target, axisR.target);
+    display.setCursor(0, 36);
+    display.print(line);
+
+    // 连接状态
+    display.setCursor(0, 46);
+#if COMM_BLE
+    display.print(s_bleClients > 0 ? "BLE connected" : "BLE waiting..");
+#else
+    display.print("AP 192.168.4.1");
+    snprintf(line, sizeof(line), "%uc", (unsigned)WiFi.softAPgetStationNum());
+    display.setCursor(112, 46);
+    display.print(line);
+#endif
+
+    // 剩余内存
+    snprintf(line, sizeof(line), "heap %uK", (unsigned)(ESP.getFreeHeap() / 1024));
+    display.setCursor(0, 56);
+    display.print(line);
+
+    display.display();
+
+    vTaskDelay(pdMS_TO_TICKS(200));   // 5Hz 刷新，够看又不浪费 CPU
+  }
+}
+#endif  // ENABLE_OLED
 
 /* ---------------- setup / loop ---------------- */
 void setup() {
@@ -637,7 +900,9 @@ void setup() {
     Serial.println("[ERR] LEDC attach failed");
   }
 
+  // 上电即停：目标速度全部归零，且默认手动模式（没有手机指令就一直不动）
   motorStopNow();
+  Serial.println("[MODE] 上电默认手动/停止，页面上点「切到自动」才自动避障");
 
   // 蜂鸣器自检：开机嘀嘀两声，听得到就说明 GPIO6 和蜂鸣器都通了
   buzzerInit();
@@ -645,6 +910,21 @@ void setup() {
   buzzerWrite(false); delay(80);
   buzzerWrite(true);  delay(80);
   buzzerWrite(false);
+
+#if ENABLE_OLED
+  // OLED 初始化（软件 SPI，任意 GPIO）
+  // 注意：SPI 屏读不回状态，接线错了 begin() 也可能成功，不显示只能查线
+  if (!display.begin(SSD1306_SWITCHCAPVCC)) {
+    Serial.println("[ERR] SSD1306 初始化失败（内存分配/SPI 句柄）");
+  } else {
+    Serial.printf("[OLED] SSD1306 128x64  mode=%d CLK=%d MOSI=%d DC=%d RST=%d CS=%d\n",
+                  OLED_MODE, OLED_CLK, OLED_MOSI, OLED_DC, OLED_RST, OLED_CS);
+  }
+  display.clearDisplay();
+  display.display();
+#else
+  Serial.println("[OLED] 已关闭 (ENABLE_OLED 0)，不占用 IO17/18/19 与 IO5");
+#endif
 
   irQueue = xQueueCreate(1, sizeof(uint8_t));
   configASSERT(irQueue != nullptr);
@@ -654,9 +934,17 @@ void setup() {
   xTaskCreatePinnedToCore(taskIrSensor,  "ir",   3072, nullptr, 4, nullptr, 1);
   xTaskCreatePinnedToCore(taskDrive,     "drive",4096, nullptr, 5, nullptr, 1);
   xTaskCreatePinnedToCore(taskIndicator, "led",  3072, nullptr, 1, nullptr, 0);
+#if ENABLE_OLED
+  xTaskCreatePinnedToCore(taskDisplay,   "disp", 4096, nullptr, 1, nullptr, 0);
+#endif
 
-  // WiFi 放在最后起：先把电机/传感器初始化好，避免 AP 启动期间 GPIO 还悬空
-  xTaskCreatePinnedToCore(taskComm, "comm", 8192, nullptr, 3, nullptr, 0);
+  // 通信放在最后起：先把电机/传感器初始化好，避免射频启动期间 GPIO 还悬空
+#if COMM_BLE
+  xTaskCreatePinnedToCore(taskCommBle,  "ble",  6144, nullptr, 3, nullptr, 0);
+#endif
+#if COMM_WIFI
+  xTaskCreatePinnedToCore(taskCommWifi, "wifi", 8192, nullptr, 3, nullptr, 0);
+#endif
 }
 
 void loop() {

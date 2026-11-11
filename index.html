@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#14161a">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>MiniCar</title>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;overflow:hidden;background:#14161a;color:#e8eaed;
+  font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+  user-select:none;-webkit-user-select:none;touch-action:none}
+#app{display:flex;flex-direction:column;height:100%;padding:10px 14px 18px;gap:10px}
+#hud{display:flex;align-items:center;gap:8px;font-size:13px;color:#9aa0a6;flex:0 0 auto;min-height:30px}
+#dot{width:9px;height:9px;border-radius:50%;background:#5f6368;flex:0 0 auto}
+#dot.on{background:#34c759;box-shadow:0 0 8px #34c759}
+#dot.off{background:#ff453a}
+#dot.wait{background:#ff9f0a}
+#ir{margin-left:auto;font-variant-numeric:tabular-nums}
+#btnConn{height:30px;padding:0 14px;border-radius:8px;border:1px solid #3f7cf6;
+  background:#1c3a6b;color:#bcd4ff;font-size:13px;font-weight:500}
+#btnConn:active{background:#24467d}
+#chain{flex:1 1 auto;display:flex;align-items:center;justify-content:center;min-height:0}
+#pad{position:relative;width:min(78vw,52vh);aspect-ratio:1;border-radius:50%;
+  background:radial-gradient(circle at 50% 45%,#22262c,#171a1f 70%);
+  border:1px solid #2c3138;touch-action:none;transition:border-color .15s}
+#pad.act{border-color:#3f7cf6}
+#zone{position:absolute;left:calc(50% - 11%);top:7%;width:22%;height:86%;
+  border-radius:14px;background:rgba(63,124,246,.09);
+  border-left:1px dashed rgba(63,124,246,.40);border-right:1px dashed rgba(63,124,246,.40);
+  pointer-events:none}
+#knob{position:absolute;left:50%;top:50%;width:32%;aspect-ratio:1;border-radius:50%;
+  transform:translate(-50%,-50%);
+  background:radial-gradient(circle at 42% 36%,#5b9bff,#2f6bd8);
+  box-shadow:0 6px 18px rgba(47,107,216,.45);transition:box-shadow .15s}
+#pad.act #knob{box-shadow:0 8px 24px rgba(91,155,255,.65)}
+#panel{flex:0 0 auto;display:flex;flex-direction:column;gap:10px}
+.row{display:flex;align-items:center;gap:10px}
+.row label{font-size:13px;color:#9aa0a6;width:38px}
+#spd{flex:1;-webkit-appearance:none;height:6px;border-radius:3px;background:#2c3138;outline:none}
+#spd::-webkit-slider-thumb{-webkit-appearance:none;width:24px;height:24px;border-radius:50%;
+  background:#e8eaed;border:none;box-shadow:0 2px 6px rgba(0,0,0,.5)}
+#spdv{font-size:13px;width:34px;text-align:right;font-variant-numeric:tabular-nums}
+.btn{flex:1;height:46px;border-radius:12px;border:1px solid #2c3138;background:#1e2228;
+  color:#e8eaed;font-size:15px;font-weight:500}
+.btn:active{background:#262b33}
+.btn.on{background:#1c3a6b;border-color:#3f7cf6;color:#bcd4ff}
+.btn.stop{background:#3a1d1d;border-color:#6b2c2c;color:#ffb3b3}
+.btn.stop:active{background:#4a2424}
+#tip{font-size:11px;color:#5f6368;text-align:center;line-height:1.5}
+#warn{display:none;margin:0 0 6px;padding:10px 12px;border-radius:10px;
+  background:#3a1d1d;border:1px solid #6b2c2c;color:#ffb3b3;font-size:12px;line-height:1.6}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="warn"></div>
+
+  <div id="hud">
+    <button id="btnConn">连接小车</button>
+    <span id="dot" class="off"></span><span id="sta">未连接</span>
+    <span id="ir">IR - / -</span>
+  </div>
+
+  <div id="chain">
+    <div id="pad"><div id="zone"></div><div id="knob"></div></div>
+  </div>
+
+  <div id="panel">
+    <div class="row">
+      <label>速度</label>
+      <input id="spd" type="range" min="20" max="100" step="5" value="60">
+      <b id="spdv">60</b>
+    </div>
+    <div class="row">
+      <button id="btnAuto" class="btn">切到自动</button>
+      <button id="btnStop" class="btn stop">急停</button>
+    </div>
+    <div id="tip">点「连接小车」选中 MiniCar · 摇杆中间蓝条内向前 = 直行 · 松手即停</div>
+  </div>
+</div>
+
+<script>
+/* ===== 与固件对齐的 GATT 定义（Nordic UART Service） ===== */
+var SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+    RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e',   // 手机写指令 -> 车
+    TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // 车 notify 状态 -> 手机
+
+var pad = document.getElementById('pad'),
+    knob = document.getElementById('knob'),
+    dot = document.getElementById('dot'),
+    sta = document.getElementById('sta'),
+    irEl = document.getElementById('ir'),
+    spd = document.getElementById('spd'),
+    spdv = document.getElementById('spdv'),
+    btnConn = document.getElementById('btnConn'),
+    btnAuto = document.getElementById('btnAuto'),
+    btnStop = document.getElementById('btnStop'),
+    warn = document.getElementById('warn');
+
+var enc = new TextEncoder();
+
+var device = null, rxChar = null, txChar = null;
+var connected = false, txBusy = false;
+var speed = 60;
+var vec = { x: 0, y: 0 };
+var dragging = false;
+var autoMode = false;
+
+/* 摇杆死区（单位：摇杆半径）
+   DZX 削掉手指左右手抖 -> 落在中间蓝条里就是直行
+   DZY 防止轻触就往前爬 */
+var DZX = 0.22, DZY = 0.10;
+
+function dz(v, d) {
+  var a = Math.abs(v);
+  if (a <= d) return 0;
+  var s = (a - d) / (1 - d);
+  if (s > 1) s = 1;
+  return v < 0 ? -s : s;
+}
+
+function setStatus(txt, cls) {
+  sta.textContent = txt;
+  dot.className = cls;
+}
+
+/* ---------------- 连接管理 ---------------- */
+
+async function linkUp(dev) {
+  setStatus('连接中…', 'wait');
+  device = dev;
+  dev.removeEventListener('gattserverdisconnected', onLost);
+  dev.addEventListener('gattserverdisconnected', onLost);
+
+  try {
+    var srv = await dev.gatt.connect();
+    var svc = await srv.getPrimaryService(SVC);
+
+    rxChar = await svc.getCharacteristic(RX);
+    txChar = await svc.getCharacteristic(TX);
+
+    txChar.addEventListener('characteristicvaluechanged', onNotify);
+    await txChar.startNotifications();
+
+    connected = true;
+    txBusy = false;
+    setStatus('已连接', 'on');
+    btnConn.style.display = 'none';
+    keepAwake();
+  } catch (e) {
+    connected = false;
+    rxChar = txChar = null;
+    setStatus('连接失败', 'off');
+    btnConn.style.display = '';
+    btnConn.textContent = '重试连接';
+    console.warn('linkUp failed', e);
+  }
+}
+
+/* 用户手势：点按钮选设备。filters 用名字前缀，扫描列表里只出现小车 */
+async function pickDevice() {
+  if (!navigator.bluetooth) {
+    showWarn('当前浏览器不支持 Web Bluetooth。Android 请用 Chrome 或 Edge，iOS 的 Safari 全部不支持。');
+    return;
+  }
+  setStatus('选择设备…', 'wait');
+  try {
+    var dev = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'MiniCar' }],
+      optionalServices: [SVC]
+    });
+    await linkUp(dev);
+  } catch (e) {
+    setStatus(connected ? '已连接' : '未连接', connected ? 'on' : 'off');
+    if (e && e.name !== 'NotFoundError') console.warn(e);
+  }
+}
+
+/* 免选择框重连：拿之前授权过的设备直接连。
+   没授权过就返回 false，交给用户点按钮 */
+async function silentReconnect() {
+  if (!navigator.bluetooth || !navigator.bluetooth.getDevices) return false;
+  try {
+    var list = await navigator.bluetooth.getDevices();
+    for (var i = 0; i < list.length; i++) {
+      var n = list[i].name || '';
+      if (n.indexOf('MiniCar') === 0) {
+        await linkUp(list[i]);
+        return connected;
+      }
+    }
+  } catch (e) {
+    console.warn('silentReconnect', e);
+  }
+  return false;
+}
+
+var retry = 0;
+
+function onLost() {
+  connected = false;
+  rxChar = txChar = null;
+  txBusy = false;
+  dragging = false;
+  setVec(0, 0);
+  pad.classList.remove('act');
+  irEl.textContent = 'IR - / -';
+  btnConn.style.display = '';
+  btnConn.textContent = '重连';
+
+  if (retry < 2) {
+    retry++;
+    setStatus('已断开，重连中…', 'wait');
+    setTimeout(function () { if (!connected) silentReconnect(); }, 600);
+  } else {
+    setStatus('已断开', 'off');
+  }
+}
+
+/* ---------------- 收发 ---------------- */
+
+/* 优先 Write Without Response（不占等回包的往返），失败再退回带响应写。
+   txBusy 做单帧节流：上一帧还在发就丢掉这一帧，反正下一帧会覆盖，遥控不怕丢帧 */
+async function send(s) {
+  if (!rxChar || txBusy) return false;
+  txBusy = true;
+  var data = enc.encode(s);
+  try {
+    await rxChar.writeValueWithoutResponse(data);
+  } catch (e) {
+    try { await rxChar.writeValue(data); } catch (e2) {}
+  }
+  txBusy = false;
+  return true;
+}
+
+/* "ST,<自动>,<左IR>,<右IR>" */
+function onNotify(e) {
+  var a = String(new TextDecoder().decode(e.target.value)).split(',');
+  if (a[0] !== 'ST') return;
+  autoMode = (a[1] === '1');
+  btnAuto.className = autoMode ? 'btn on' : 'btn';
+  btnAuto.textContent = autoMode ? '自动中·点此退出' : '切到自动';
+  irEl.textContent = 'IR ' + (a[2] === '1' ? 'L!' : 'L-') + ' / ' + (a[3] === '1' ? 'R!' : 'R-');
+}
+
+function flush() {
+  if (!dragging) return;
+  var y = dz(-vec.y, DZY), x = dz(vec.x, DZX);   // 先做死区整形，再算差速
+  var l = y + x, r = y - x;
+  var m = Math.max(Math.abs(l), Math.abs(r));
+  if (m > 1) { l /= m; r /= m; }
+  send('M,' + Math.round(l * speed) + ',' + Math.round(r * speed));
+}
+
+/* ---------------- 摇杆 ---------------- */
+
+function setVec(x, y) {
+  vec.x = x; vec.y = y;
+  var kx = dz(x, DZX), ky = dz(y, DZY);
+  knob.style.transform = 'translate(-50%,-50%) translate(' +
+    (kx * 34) + '%,' + (ky * 34) + '%)';
+}
+
+function center() {
+  var r = pad.getBoundingClientRect();
+  return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, R: r.width / 2 };
+}
+
+function move(e) {
+  var c = center();
+  var dx = (e.clientX - c.cx) / c.R;
+  var dy = (e.clientY - c.cy) / c.R;
+  var m = Math.hypot(dx, dy);
+  if (m > 1) { dx /= m; dy /= m; }
+  setVec(dx, dy);
+  flush();
+}
+
+pad.addEventListener('pointerdown', function (e) {
+  pad.setPointerCapture(e.pointerId);
+  dragging = true;
+  retry = 0;
+  pad.classList.add('act');
+  move(e);
+});
+pad.addEventListener('pointermove', function (e) { if (dragging) move(e); });
+
+function release() {
+  if (!dragging) return;
+  dragging = false;
+  pad.classList.remove('act');
+  setVec(0, 0);
+  send('M,0,0');
+}
+pad.addEventListener('pointerup', release);
+pad.addEventListener('pointercancel', release);
+pad.addEventListener('pointerleave', function () { if (dragging) release(); });
+
+/* ---------------- 按钮 ---------------- */
+
+btnConn.addEventListener('click', pickDevice);
+
+spd.addEventListener('input', function () {
+  speed = parseInt(spd.value, 10);
+  spdv.textContent = speed;
+});
+
+btnAuto.addEventListener('click', function () {
+  send(autoMode ? 'M,0,0' : 'A');
+  dragging = false; setVec(0, 0);
+});
+
+btnStop.addEventListener('click', function () {
+  send('S');
+  dragging = false; setVec(0, 0);
+});
+
+/* 拖动期间每 50ms 补发一帧，避免丢帧导致车“粘住”上一速度 */
+setInterval(function () { if (dragging) flush(); }, 50);
+
+/* ---------------- 杂项 ---------------- */
+
+function showWarn(msg) {
+  warn.textContent = msg;
+  warn.style.display = 'block';
+}
+
+/* 遥控时别让屏幕自己灭掉 */
+var wakeLock = null;
+async function keepAwake() {
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) {}
+}
+
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'visible') {
+    keepAwake();
+    if (!connected) silentReconnect();
+  } else {
+    /* 切到后台时安卓可能主动断 BLE，回前台再连 */
+    dragging = false; setVec(0, 0);
+  }
+});
+
+/* ---------------- 启动 ---------------- */
+
+if (!navigator.bluetooth) {
+  showWarn('此浏览器不支持 Web Bluetooth，无法控制小车。Android 请用 Chrome 或 Edge 打开本页；iOS 的 Safari、Chrome 均不支持。');
+} else {
+  /* 之前授权过就直接连，省掉每次点设备框 */
+  silentReconnect().then(function (ok) {
+    if (!ok) setStatus('未连接', 'off');
+  });
+}
+</script>
+</body>
+</html>
